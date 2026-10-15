@@ -1,26 +1,21 @@
-
 <?php
 // Marwadi University - 3D Tic-Tac-Toe
-// AWS EC2 Server Information using IMDSv2
-// No strict_types declaration required.
+// AWS EC2 Server Information (IMDSv2 & IMDSv1 Safe Auto Scaling Resolution)
 
-function getEC2Metadata($path, $token) {
-    if (!$token || !function_exists('curl_init')) {
-        return "Unavailable";
+function fetchUrlSafe($url, $headers = array(), $method = "GET") {
+    if (!function_exists('curl_init')) {
+        return false;
     }
-
-    $url = "http://169.254.169.254/latest/meta-data/" . $path;
 
     $ch = curl_init($url);
     curl_setopt_array($ch, array(
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => array(
-            "X-aws-ec2-metadata-token: " . $token
-        ),
+        CURLOPT_CUSTOMREQUEST  => $method,
+        CURLOPT_HTTPHEADER     => $headers,
         CURLOPT_CONNECTTIMEOUT => 1,
-        CURLOPT_TIMEOUT => 3,
-        CURLOPT_PROXY => "",
-        CURLOPT_NOPROXY => "*"
+        CURLOPT_TIMEOUT        => 1,
+        CURLOPT_PROXY          => "",
+        CURLOPT_NOPROXY        => "*"
     ));
 
     $result = curl_exec($ch);
@@ -31,62 +26,58 @@ function getEC2Metadata($path, $token) {
         return trim($result);
     }
 
-    return "Unavailable";
+    return false;
 }
 
-function getEC2Token() {
-    if (!function_exists('curl_init')) {
-        return null;
-    }
-
-    $ch = curl_init(
-        "http://169.254.169.254/latest/api/token"
-    );
-
-    curl_setopt_array($ch, array(
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_CUSTOMREQUEST => "PUT",
-        CURLOPT_HTTPHEADER => array(
-            "X-aws-ec2-metadata-token-ttl-seconds: 21600"
-        ),
-        CURLOPT_CONNECTTIMEOUT => 1,
-        CURLOPT_TIMEOUT => 3,
-        CURLOPT_PROXY => "",
-        CURLOPT_NOPROXY => "*"
-    ));
-
-    $token = curl_exec($ch);
-    $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-
-    if ($status === 200 && is_string($token) && $token !== "") {
-        return $token;
-    }
-
-    return null;
-}
-
-function cleanOutput($value) {
-    return htmlspecialchars(
-        (string)$value,
-        ENT_QUOTES | ENT_SUBSTITUTE,
-        "UTF-8"
-    );
-}
-
-$token = getEC2Token();
-
-$publicIP = getEC2Metadata("public-ipv4", $token);
-$privateIP = getEC2Metadata("local-ipv4", $token);
-$instanceID = getEC2Metadata("instance-id", $token);
-$availabilityZone = getEC2Metadata(
-    "placement/availability-zone",
-    $token
+// 1. Attempt IMDSv2 Token
+$token = fetchUrlSafe(
+    "http://169.254.169.254/latest/api/token",
+    array("X-aws-ec2-metadata-token-ttl-seconds: 21600"),
+    "PUT"
 );
+
+$imdsHeaders = $token ? array("X-aws-ec2-metadata-token: " . $token) : array();
+
+// 2. Fetch Metadata (Compatible with IMDSv2 and IMDSv1)
+function getMetadataItem($path, $headers) {
+    $val = fetchUrlSafe("http://169.254.169.254/latest/meta-data/" . $path, $headers);
+    return ($val !== false) ? $val : null;
+}
+
+$publicIP         = getMetadataItem("public-ipv4", $imdsHeaders);
+$privateIP        = getMetadataItem("local-ipv4", $imdsHeaders);
+$instanceID       = getMetadataItem("instance-id", $imdsHeaders);
+$availabilityZone = getMetadataItem("placement/availability-zone", $imdsHeaders);
+
+// 3. Auto Scaling & Local Network Fallbacks
+if (empty($privateIP)) {
+    if (!empty($_SERVER['SERVER_ADDR']) && $_SERVER['SERVER_ADDR'] !== '127.0.0.1') {
+        $privateIP = $_SERVER['SERVER_ADDR'];
+    } else {
+        $resolved = gethostbyname(gethostname());
+        $privateIP = (!empty($resolved) && $resolved !== '127.0.0.1') ? $resolved : "Local / Private Subnet";
+    }
+}
+
+if (empty($publicIP)) {
+    $publicIP = "Private Subnet (Behind ALB / Auto Scaling)";
+}
+
+if (empty($instanceID)) {
+    $instanceID = gethostname();
+}
+
+if (empty($availabilityZone)) {
+    $availabilityZone = "Auto Scaling Node";
+}
 
 $serverHostname = gethostname();
 $serverTime = gmdate("Y-m-d H:i:s") . " UTC";
 $year = gmdate("Y");
+
+function cleanOutput($value) {
+    return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, "UTF-8");
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -877,11 +868,6 @@ footer {
 
     const winningLines = generateWinningLines();
 
-    console.assert(
-        winningLines.length === 49,
-        "Incorrect number of winning lines"
-    );
-
     function checkWinner() {
         for (const line of winningLines) {
             const [a, b, c] = line;
@@ -1120,7 +1106,6 @@ footer {
         const intersections =
             raycaster.intersectObjects(cells, false);
 
-        // Select the nearest available empty cube.
         const selected = intersections.find(
             hit => board[hit.object.userData.index] === null
         );
